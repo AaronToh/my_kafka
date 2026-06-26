@@ -1,18 +1,92 @@
 #include <cstring>
+#include <fcntl.h>
 #include <iostream>
+#include <map>
 #include <netinet/in.h>
 #include <unistd.h>
+#include <vector>
 #include <sys/epoll.h>
 #include <sys/socket.h>
 
-ssize_t recvAll(int socket, char* buffer, int32_t len) {
-    int32_t total = 0;
-    while (total < len) {
-        ssize_t n = recv(socket, buffer + total, len - total, 0);
-        if (n <= 0) return 0;
-        total += n;
+struct ConnectionState {
+    size_t li = 0;
+    size_t mi = 0;
+    std::vector<char> lenBuffer = std::vector<char>(4);
+    std::vector<char> msgBuffer;
+};
+
+void closeConnection(int clientSocket, int epollfd, std::map<int, ConnectionState>& connections) {
+    close(clientSocket);
+    epoll_ctl(epollfd, EPOLL_CTL_DEL, clientSocket, nullptr);
+    connections.erase(clientSocket);
+}
+
+void handleMessage(int clientSocket, int epollfd, std::map<int, ConnectionState>& connections, std::vector<char>& msgBuffer) {
+    int16_t apiKey, apiVersion, clientIdLen;
+    int32_t correlationId;
+
+    memcpy(&apiKey, msgBuffer.data(), 2);
+    apiKey = ntohs(apiKey);
+    memcpy(&apiVersion, msgBuffer.data() + 2, 2);
+    apiVersion = ntohs(apiVersion);
+    memcpy(&correlationId, msgBuffer.data() + 4, 4);
+    correlationId = ntohl(correlationId);
+    memcpy(&clientIdLen, msgBuffer.data() + 8, 2);
+    clientIdLen = ntohs(clientIdLen);
+    char clientId[clientIdLen + 1];
+    memset(clientId, 0, clientIdLen + 1);
+    if (clientIdLen > 0) memcpy(clientId, msgBuffer.data() + 10, clientIdLen);
+
+    std::cout << "apiKey: " << apiKey << "\n";
+    std::cout << "apiVersion: " << apiVersion << "\n";
+    std::cout << "correlationId: " << correlationId << "\n";
+    std::cout << "clientId: " << clientId << "\n";
+
+    if (apiKey == 18) {
+        if (apiVersion <= 2) {
+            char response[20];
+            int32_t respLen = htonl(16);
+            memcpy(response, &respLen, 4);
+            int32_t corrId = htonl(correlationId);
+            memcpy(response + 4, &corrId, 4);
+            int16_t error = htons(0);
+            memcpy(response + 8, &error, 2);
+            int32_t arrLength = htonl(1);
+            memcpy(response + 10, &arrLength, 4);
+            int16_t respApiKey = htons(18);
+            memcpy(response + 14, &respApiKey, 2);
+            int16_t minVersion = htons(0);
+            memcpy(response + 16, &minVersion, 2);
+            int16_t maxVersion = htons(0);
+            memcpy(response + 18, &maxVersion, 2);
+            send(clientSocket, response, 20, 0);
+        } else {
+            char response[23];
+            int32_t respLen = htonl(19);
+            memcpy(response, &respLen, 4);
+            int32_t corrId = htonl(correlationId);
+            memcpy(response + 4, &corrId, 4);
+            int16_t error = htons(0);
+            memcpy(response + 8, &error, 2);
+            uint8_t arrLength = 2;
+            memcpy(response + 10, &arrLength, 1);
+            int16_t respApiKey = htons(18);
+            memcpy(response + 11, &respApiKey, 2);
+            int16_t minVersion = htons(0);
+            memcpy(response + 13, &minVersion, 2);
+            int16_t maxVersion = htons(3);
+            memcpy(response + 15, &maxVersion, 2);
+            uint8_t entryTags = 0;
+            memcpy(response + 17, &entryTags, 1);
+            int32_t throttleTimeMs = htonl(0);
+            memcpy(response + 18, &throttleTimeMs, 4);
+            uint8_t respTags = 0;
+            memcpy(response + 22, &respTags, 1);
+            send(clientSocket, response, 23, 0);
+        }
+    } else {
+        closeConnection(clientSocket, epollfd, connections);
     }
-    return total;
 }
 
 int main() {
@@ -25,8 +99,8 @@ int main() {
     sockaddr_in serverAddress;
     serverAddress.sin_family = AF_INET;
     serverAddress.sin_port = htons(9092);
-    serverAddress.sin_addr.s_addr = INADDR_ANY; // listen on all interfaces - wifi, IPv6
-    
+    serverAddress.sin_addr.s_addr = INADDR_ANY;
+
     int opt = 1;
     setsockopt(serverSocket, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
 
@@ -49,12 +123,13 @@ int main() {
     epoll_event ev;
     ev.events = EPOLLIN;
     ev.data.fd = serverSocket;
-
     if (epoll_ctl(epollfd, EPOLL_CTL_ADD, serverSocket, &ev) == -1) {
         std::cerr << "Configure epoll: " << strerror(errno) << "\n";
     }
-    
+
     const int MAX_EVENTS = 10;
+    std::map<int, ConnectionState> connections;
+
     while (true) {
         epoll_event events[MAX_EVENTS];
         int n = epoll_wait(epollfd, events, MAX_EVENTS, -1);
@@ -62,7 +137,7 @@ int main() {
             std::cerr << "Wait: " << strerror(errno) << "\n";
             break;
         }
-    
+
         for (int i = 0; i < n; i++) {
             if (events[i].data.fd == serverSocket) {
                 int clientSocket = accept(serverSocket, nullptr, nullptr);
@@ -70,97 +145,47 @@ int main() {
                     std::cerr << "Accept: " << strerror(errno) << "\n";
                     continue;
                 }
-                epoll_event ev;
-                ev.events = EPOLLIN;
-                ev.data.fd = clientSocket;
-                if (epoll_ctl(epollfd, EPOLL_CTL_ADD, clientSocket, &ev) == -1) {
+                int flags = fcntl(clientSocket, F_GETFL, 0);
+                fcntl(clientSocket, F_SETFL, flags | O_NONBLOCK);
+                epoll_event cev;
+                cev.events = EPOLLIN;
+                cev.data.fd = clientSocket;
+                if (epoll_ctl(epollfd, EPOLL_CTL_ADD, clientSocket, &cev) == -1) {
                     std::cerr << "Interest epoll: " << strerror(errno) << "\n";
                 }
+                connections[clientSocket] = ConnectionState{};
             } else {
                 int clientSocket = events[i].data.fd;
-                char lenBuf[4];
-                if (recvAll(clientSocket, lenBuf, 4) <= 0) {
-                    close(clientSocket);
-                    epoll_ctl(epollfd, EPOLL_CTL_DEL, clientSocket, nullptr);
-                    continue;
-                }
+                ConnectionState& state = connections[clientSocket];
 
-                int32_t msg_length;
-                memcpy(&msg_length, lenBuf, 4);
-                msg_length = ntohl(msg_length);
-
-                char msg[msg_length];
-                if (recvAll(clientSocket, msg, msg_length) <= 0) {
-                    close(clientSocket);
-                    epoll_ctl(epollfd, EPOLL_CTL_DEL, clientSocket, nullptr);
-                    continue;
-                }
-
-                int16_t api_key, api_version, client_id_len;
-                int32_t correlation_id;
-
-                memcpy(&api_key, msg + 0, 2);
-                api_key = ntohs(api_key);
-                memcpy(&api_version, msg + 2, 2);
-                api_version = ntohs(api_version);
-                memcpy(&correlation_id, msg + 4, 4);
-                correlation_id = ntohl(correlation_id);
-                memcpy(&client_id_len, msg + 8, 2);
-                client_id_len = ntohs(client_id_len);
-                char client_id[client_id_len + 1];
-                memset(client_id, 0, client_id_len + 1);
-                if (client_id_len > 0) memcpy(client_id, msg + 10, client_id_len);
-
-                std::cout << "api_key: " << api_key << "\n";
-                std::cout << "api_version: " << api_version << "\n";
-                std::cout << "correlation_id: " << correlation_id << "\n";
-                std::cout << "client_id: " << client_id << "\n";
-
-                if (api_key == 18) {
-                    if (api_version <= 2) {
-                        char response[20];
-                        int32_t resp_len = htonl(16);
-                        memcpy(response, &resp_len, 4);
-                        correlation_id = htonl(correlation_id);
-                        memcpy(response + 4, &correlation_id, 4);
-                        int16_t error = htons(0);
-                        memcpy(response + 8, &error, 2);
-                        int32_t arr_length = htonl(1);
-                        memcpy(response + 10, &arr_length, 4);
-                        int16_t api_key = htons(18);
-                        memcpy(response + 14, &api_key, 2);
-                        int16_t min_version = htons(0);
-                        memcpy(response + 16, &min_version, 2);
-                        int16_t max_version = htons(0);
-                        memcpy(response + 18, &max_version, 2);
-                        send(clientSocket, response, 20, 0);
-                    } else {
-                        char response[23];
-                        int32_t resp_len = htonl(19);
-                        memcpy(response, &resp_len, 4);
-                        correlation_id = htonl(correlation_id);
-                        memcpy(response + 4, &correlation_id, 4);
-                        int16_t error = htons(0);
-                        memcpy(response + 8, &error, 2);
-                        uint8_t arr_length = 2;
-                        memcpy(response + 10, &arr_length, 1);
-                        int16_t api_key = htons(18);
-                        memcpy(response + 11, &api_key, 2);
-                        int16_t min_version = htons(0);
-                        memcpy(response + 13, &min_version, 2);
-                        int16_t max_version = htons(3);
-                        memcpy(response + 15, &max_version, 2);
-                        uint8_t entry_tags = 0;
-                        memcpy(response + 17, &entry_tags, 1);
-                        int32_t throttle_time_ms = htonl(0);
-                        memcpy(response + 18, &throttle_time_ms, 4);
-                        uint8_t resp_tags = 0;
-                        memcpy(response + 22, &resp_tags, 1);
-                        send(clientSocket, response, 23, 0);
+                if (state.li < state.lenBuffer.size()) {
+                    ssize_t bytesRead = recv(clientSocket, state.lenBuffer.data() + state.li, state.lenBuffer.size() - state.li, 0);
+                    if (bytesRead <= 0) {
+                        closeConnection(clientSocket, epollfd, connections);
+                        continue;
                     }
-                } else {
-                    close(clientSocket);
-                    epoll_ctl(epollfd, EPOLL_CTL_DEL, clientSocket, nullptr);
+                    state.li += bytesRead;
+                    if (state.li == state.lenBuffer.size()) {
+                        int32_t msgLength;
+                        memcpy(&msgLength, state.lenBuffer.data(), 4);
+                        msgLength = ntohl(msgLength);
+                        state.msgBuffer.resize(msgLength);
+                    }
+                }
+
+                if (state.li == state.lenBuffer.size() && !state.msgBuffer.empty()) {
+                    ssize_t bytesRead = recv(clientSocket, state.msgBuffer.data() + state.mi, state.msgBuffer.size() - state.mi, 0);
+                    if (bytesRead <= 0) {
+                        closeConnection(clientSocket, epollfd, connections);
+                        continue;
+                    }
+                    state.mi += bytesRead;
+                    if (state.mi == state.msgBuffer.size()) {
+                        handleMessage(clientSocket, epollfd, connections, state.msgBuffer);
+                        state.li = 0;
+                        state.mi = 0;
+                        state.msgBuffer.clear();
+                    }
                 }
             }
         }
