@@ -1,5 +1,7 @@
+#include <cstring>
 #include <iostream>
 #include <netinet/in.h>
+#include <unistd.h>
 #include <sys/epoll.h>
 #include <sys/socket.h>
 
