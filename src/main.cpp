@@ -36,6 +36,8 @@ void handleMessage(int clientSocket, int epollfd, std::map<int, ConnectionState>
     char clientId[clientIdLen + 1];
     memset(clientId, 0, clientIdLen + 1);
     if (clientIdLen > 0) memcpy(clientId, msgBuffer.data() + 10, clientIdLen);
+    int reqBodyOff = 10 + clientIdLen;
+    if (apiVersion > 2) reqBodyOff += 1; // ignore tagged fields
 
     std::cout << "apiKey: " << apiKey << "\n";
     std::cout << "apiVersion: " << apiVersion << "\n";
@@ -83,6 +85,40 @@ void handleMessage(int clientSocket, int epollfd, std::map<int, ConnectionState>
             uint8_t respTags = 0;
             memcpy(response + 22, &respTags, 1);
             send(clientSocket, response, 23, 0);
+        }
+    } else if (apiKey == 3) {
+        std::vector<std::string> names;
+        if (apiVersion <= 2) {
+            int32_t arrLength;
+            memcpy(&arrLength, msgBuffer.data() + reqBodyOff, 4);
+            arrLength = ntohl(arrLength);
+            reqBodyOff += 4;
+            names.resize(arrLength); // Todo: handle -1 length
+            for (int i = 0; i < arrLength; i++) {
+                int16_t nameLen;
+                memcpy(&nameLen, msgBuffer.data() + reqBodyOff, 2);
+                reqBodyOff += 2;
+                nameLen = ntohs(nameLen);
+                char name[nameLen + 1];
+                memset(name, 0, nameLen + 1);
+                if (nameLen > 0) memcpy(name, msgBuffer.data() + reqBodyOff, nameLen);
+                names[i] = std::string(name, nameLen);
+                reqBodyOff += nameLen;
+            }
+        } else {
+            uint8_t arrLength = msgBuffer[reqBodyOff++]; // assume length 1
+            arrLength--;
+            names.resize(arrLength);
+            for (int i = 0; i < arrLength; i++) {
+                uint8_t nameLen = msgBuffer[reqBodyOff++];
+                nameLen--;
+                char name[nameLen + 1];
+                memset(name, 0, nameLen + 1);
+                if (nameLen > 0) memcpy(name, msgBuffer.data() + reqBodyOff, nameLen);
+                names[i] = std::string(name, nameLen);
+                reqBodyOff += nameLen;
+                reqBodyOff += 1; // tagged field
+            }
         }
     } else {
         closeConnection(clientSocket, epollfd, connections);
