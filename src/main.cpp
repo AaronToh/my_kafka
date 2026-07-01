@@ -1,4 +1,5 @@
 #include <cstring>
+#include <endian.h>
 #include <fcntl.h>
 #include <iostream>
 #include <map>
@@ -23,16 +24,22 @@ void closeConnection(int clientSocket, int epollfd, std::map<int, ConnectionStat
 
 void sendApiVerResponse(int clientSocket, int32_t correlationId, int16_t apiVersion) {
     if (apiVersion <= 2) {
-        char response[26];
+        char response[32];
         char* p = response;
-        int32_t respLen = htonl(22);
+        int32_t respLen = htonl(28);
         memcpy(p, &respLen, 4); p += 4;
         int32_t corrId = htonl(correlationId);
         memcpy(p, &corrId, 4); p += 4;
         int16_t error = htons(0);
         memcpy(p, &error, 2); p += 2;
-        int32_t arrLength = htonl(2);
+        int32_t arrLength = htonl(3);
         memcpy(p, &arrLength, 4); p += 4;
+        int16_t produceKey = htons(0);
+        memcpy(p, &produceKey, 2); p += 2;
+        int16_t produceMin = htons(3);
+        memcpy(p, &produceMin, 2); p += 2;
+        int16_t produceMax = htons(3);
+        memcpy(p, &produceMax, 2); p += 2;
         int16_t metaApiKey = htons(3);
         memcpy(p, &metaApiKey, 2); p += 2;
         int16_t metaMin = htons(0);
@@ -45,19 +52,27 @@ void sendApiVerResponse(int clientSocket, int32_t correlationId, int16_t apiVers
         memcpy(p, &apiVerMin, 2); p += 2;
         int16_t apiVerMax = htons(0);
         memcpy(p, &apiVerMax, 2); p += 2;
-        send(clientSocket, response, 26, 0);
+        send(clientSocket, response, 32, 0);
     } else {
-        // compact arrLength=3 means 2 entries: Metadata(3) and ApiVersions(18)
-        char response[30];
+        // compact arrLength=4 means 3 entries: Produce(0), Metadata(3), ApiVersions(18)
+        char response[37];
         char* p = response;
-        int32_t respLen = htonl(26);
+        int32_t respLen = htonl(33);
         memcpy(p, &respLen, 4); p += 4;
         int32_t corrId = htonl(correlationId);
         memcpy(p, &corrId, 4); p += 4;
         int16_t error = htons(0);
         memcpy(p, &error, 2); p += 2;
-        uint8_t arrLength = 3;
+        uint8_t arrLength = 4;
         memcpy(p, &arrLength, 1); p += 1;
+        int16_t produceKey = htons(0);
+        memcpy(p, &produceKey, 2); p += 2;
+        int16_t produceMin = htons(3);
+        memcpy(p, &produceMin, 2); p += 2;
+        int16_t produceMax = htons(3);
+        memcpy(p, &produceMax, 2); p += 2;
+        uint8_t produceTags = 0;
+        memcpy(p, &produceTags, 1); p += 1;
         int16_t metaApiKey = htons(3);
         memcpy(p, &metaApiKey, 2); p += 2;
         int16_t metaMin = htons(0);
@@ -78,7 +93,7 @@ void sendApiVerResponse(int clientSocket, int32_t correlationId, int16_t apiVers
         memcpy(p, &throttleTimeMs, 4); p += 4;
         uint8_t respTags = 0;
         memcpy(p, &respTags, 1); p += 1;
-        send(clientSocket, response, 30, 0);
+        send(clientSocket, response, 37, 0);
     }
 }
 
@@ -102,6 +117,28 @@ void sendMetadataResponse(int clientSocket, int32_t correlationId) {
     int32_t topicCount = htonl(0);
     memcpy(p, &topicCount, 4); p += 4;
     send(clientSocket, response, 35, 0);
+}
+
+uint64_t readVarint(const std::vector<char>& buf, int& off) {
+    uint64_t res = 0;
+    int shift = 0;
+    while (true) {
+        uint8_t byte;
+        memcpy(&byte, buf.data() + off, 1);
+        off++;
+        res |= (uint64_t)(byte & 0x7F) << shift;
+        if ((byte & 0x80) == 0) break;
+        shift += 7;
+    }
+    return res;
+}
+
+int64_t decodeZigzag(uint64_t original) {
+    if (original % 2 == 0) {
+        return original >> 1;
+    } else {
+        return -(int64_t)(original >> 1) - 1;
+    }
 }
 
 void handleMessage(int clientSocket, int epollfd, std::map<int, ConnectionState>& connections, std::vector<char>& msgBuffer) {
@@ -129,7 +166,123 @@ void handleMessage(int clientSocket, int epollfd, std::map<int, ConnectionState>
     std::cout << "correlationId: " << correlationId << "\n";
     std::cout << "clientId: " << clientId << "\n";
 
-    if (apiKey == 18) {
+    if (apiKey == 0) {
+        int16_t transIdLen;
+        memcpy(&transIdLen, msgBuffer.data() + reqBodyOff, 2);
+        reqBodyOff += 2;
+        transIdLen = ntohs(transIdLen);
+        char transId[transIdLen + 1]; // currently unused
+        memset(transId, 0, transIdLen + 1);
+        if (transIdLen > 0) memcpy(transId, msgBuffer.data() + reqBodyOff, transIdLen);
+        reqBodyOff += transIdLen;
+        int16_t acks;
+        memcpy(&acks, msgBuffer.data() + reqBodyOff, 2);
+        reqBodyOff += 2;
+        int32_t timeout;
+        memcpy(&timeout, msgBuffer.data() + reqBodyOff, 4);
+        reqBodyOff += 4;
+        int32_t topicCount;
+        memcpy(&topicCount, msgBuffer.data() + reqBodyOff, 4);
+        reqBodyOff += 4;
+        topicCount = ntohl(topicCount);
+        for (int i = 0; i < topicCount; i++) {
+            int16_t topicNameLen;
+            memcpy(&topicNameLen, msgBuffer.data() + reqBodyOff, 2);
+            reqBodyOff += 2;
+            char topicName[topicNameLen + 1]; // currently unused
+            memset(topicName, 0, topicNameLen + 1);
+            if (topicNameLen > 0) memcpy(topicName, msgBuffer.data() + reqBodyOff, topicNameLen);
+            reqBodyOff += topicNameLen;
+            int32_t partitionCount;
+            memcpy(&partitionCount, msgBuffer.data() + reqBodyOff, 4);
+            reqBodyOff += 4;
+            partitionCount = ntohl(partitionCount);
+            for (int j = 0; j < partitionCount; j++) {
+                int32_t index;
+                memcpy(&index, msgBuffer.data() + reqBodyOff, 4);
+                reqBodyOff += 4;
+                index = ntohl(index);
+                int32_t recordsLength;
+                memcpy(&recordsLength, msgBuffer.data() + reqBodyOff, 4);
+                reqBodyOff += 4;
+                recordsLength = ntohl(recordsLength);
+                int64_t baseOffset;
+                memcpy(&baseOffset, msgBuffer.data() + reqBodyOff, 8);
+                reqBodyOff += 8;
+                baseOffset = be64toh(baseOffset);
+                int32_t batchLength;
+                memcpy(&batchLength, msgBuffer.data() + reqBodyOff, 4);
+                reqBodyOff += 4;
+                batchLength = ntohl(batchLength);
+                int32_t partitionLeaderEpoch;
+                memcpy(&partitionLeaderEpoch, msgBuffer.data() + reqBodyOff, 4);
+                reqBodyOff += 4;
+                partitionLeaderEpoch = ntohl(partitionLeaderEpoch);
+                int8_t magic;
+                memcpy(&magic, msgBuffer.data() + reqBodyOff, 1);
+                reqBodyOff += 1;
+                uint32_t crc;
+                memcpy(&crc, msgBuffer.data() + reqBodyOff, 4);
+                reqBodyOff += 4;
+                crc = ntohl(crc);
+                int16_t attributes;
+                memcpy(&attributes, msgBuffer.data() + reqBodyOff, 2);
+                reqBodyOff += 2;
+                attributes = ntohs(attributes);
+                int32_t lastOffsetDelta;
+                memcpy(&lastOffsetDelta, msgBuffer.data() + reqBodyOff, 4);
+                reqBodyOff += 4;
+                lastOffsetDelta = ntohl(lastOffsetDelta);
+                int64_t baseTimestamp;
+                memcpy(&baseTimestamp, msgBuffer.data() + reqBodyOff, 8);
+                reqBodyOff += 8;
+                baseTimestamp = be64toh(baseTimestamp);
+                int64_t maxTimestamp;
+                memcpy(&maxTimestamp, msgBuffer.data() + reqBodyOff, 8);
+                reqBodyOff += 8;
+                maxTimestamp = be64toh(maxTimestamp);
+                int64_t producerId;
+                memcpy(&producerId, msgBuffer.data() + reqBodyOff, 8);
+                reqBodyOff += 8;
+                producerId = be64toh(producerId);
+                int16_t producerEpoch;
+                memcpy(&producerEpoch, msgBuffer.data() + reqBodyOff, 2);
+                reqBodyOff += 2;
+                producerEpoch = ntohs(producerEpoch);
+                int32_t baseSequence;
+                memcpy(&baseSequence, msgBuffer.data() + reqBodyOff, 4);
+                reqBodyOff += 4;
+                baseSequence = ntohl(baseSequence);
+                int32_t recordCount;
+                memcpy(&recordCount, msgBuffer.data() + reqBodyOff, 4);
+                reqBodyOff += 4;
+                recordCount = ntohl(recordCount);
+                // records follow — each uses zigzag varint encoding
+                for (int k = 0; k < recordCount; k++) {
+                    uint64_t recordLength = readVarint(msgBuffer, reqBodyOff);
+                    reqBodyOff += 1; // attributes int8
+                    int64_t timestampDelta = decodeZigzag(readVarint(msgBuffer, reqBodyOff));
+                    uint64_t offsetDelta = readVarint(msgBuffer, reqBodyOff);
+                    int64_t keyLength = decodeZigzag(readVarint(msgBuffer, reqBodyOff));
+                    if (keyLength > 0) reqBodyOff += keyLength;
+                    int64_t valueLength = decodeZigzag(readVarint(msgBuffer, reqBodyOff));
+                    char value[valueLength];
+                    if (valueLength > 0) {
+                        memcpy(value, msgBuffer.data() + reqBodyOff, valueLength);
+                        reqBodyOff += valueLength;
+                        std::cout << "value: " << std::string(value, valueLength) << "\n";
+                    }
+                    uint64_t headersCount = readVarint(msgBuffer, reqBodyOff);
+                    for (uint64_t l = 0; l < headersCount; l++) {
+                        int64_t headerKeyLen = decodeZigzag(readVarint(msgBuffer, reqBodyOff));
+                        if (headerKeyLen > 0) reqBodyOff += headerKeyLen;
+                        int64_t headerValLen = decodeZigzag(readVarint(msgBuffer, reqBodyOff));
+                        if (headerValLen > 0) reqBodyOff += headerValLen;
+                    }
+                }
+            }
+        }
+    } else if (apiKey == 18) {
         sendApiVerResponse(clientSocket, correlationId, apiVersion);
     } else if (apiKey == 3) {
         std::vector<std::string> names;
