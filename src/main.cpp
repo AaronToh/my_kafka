@@ -4,10 +4,14 @@
 #include <iostream>
 #include <map>
 #include <netinet/in.h>
+#include <string>
 #include <unistd.h>
 #include <vector>
 #include <sys/epoll.h>
 #include <sys/socket.h>
+
+// topic -> partitions -> records (offset = index into inner vector)
+std::map<std::string, std::vector<std::vector<std::string>>> store;
 
 struct ConnectionState {
     size_t li = 0;
@@ -97,11 +101,49 @@ void sendApiVerResponse(int clientSocket, int32_t correlationId, int16_t apiVers
     }
 }
 
+void sendProduceResponse(int clientSocket, int32_t correlationId, const std::string& topicName, int32_t partitionIndex) {
+    // body: corrId(4) + responses_count(4) + name_len(2) + name + partition_responses_count(4)
+    //       + index(4) + error_code(2) + base_offset(8) + log_append_time_ms(8) + throttle_time_ms(4)
+    int16_t nameLen = (int16_t)topicName.size();
+    int totalSize = 4 + 4 + 2 + nameLen + 4 + 4 + 2 + 8 + 8 + 4;
+    std::vector<char> response(4 + totalSize);
+    char* p = response.data();
+    int32_t respLen = htonl(totalSize);
+    memcpy(p, &respLen, 4); p += 4;
+    int32_t corrId = htonl(correlationId);
+    memcpy(p, &corrId, 4); p += 4;
+    int32_t topicCount = htonl(1);
+    memcpy(p, &topicCount, 4); p += 4;
+    int16_t nameLenN = htons(nameLen);
+    memcpy(p, &nameLenN, 2); p += 2;
+    memcpy(p, topicName.data(), nameLen); p += nameLen;
+    int32_t partCount = htonl(1);
+    memcpy(p, &partCount, 4); p += 4;
+    int32_t idx = htonl(partitionIndex);
+    memcpy(p, &idx, 4); p += 4;
+    int16_t errorCode = htons(0);
+    memcpy(p, &errorCode, 2); p += 2;
+    int64_t baseOffset = 0;
+    memcpy(p, &baseOffset, 8); p += 8;
+    int64_t logAppendTime = htobe64(-1);
+    memcpy(p, &logAppendTime, 8); p += 8;
+    int32_t throttle = htonl(0);
+    memcpy(p, &throttle, 4); p += 4;
+    send(clientSocket, response.data(), response.size(), 0);
+}
+
 void sendMetadataResponse(int clientSocket, int32_t correlationId) {
-    // body: corrId(4) + brokers_count(4) + node_id(4) + host_len(2) + "localhost"(9) + port(4) + topics_count(4) = 31
-    char response[35];
-    char* p = response;
-    int32_t respLen = htonl(31);
+    // size varies by number of topics/partitions so use vector
+    // per topic: error(2) + name_len(2) + name + partitions_count(4)
+    // per partition: error(2) + index(4) + leader(4) + replicas_count(4) + replica(4) + isr_count(4) + isr(4) = 26
+    int bodySize = 4 + 19; // broker_count + broker(node_id+host+port)
+    for (auto& [name, partitions] : store)
+        bodySize += 2 + 2 + name.size() + 4 + (int)partitions.size() * 26;
+    bodySize += 4; // topic_count
+
+    std::vector<char> response(4 + 4 + bodySize);
+    char* p = response.data();
+    int32_t respLen = htonl(4 + bodySize);
     memcpy(p, &respLen, 4); p += 4;
     int32_t corrId = htonl(correlationId);
     memcpy(p, &corrId, 4); p += 4;
@@ -114,9 +156,34 @@ void sendMetadataResponse(int clientSocket, int32_t correlationId) {
     memcpy(p, "localhost", 9); p += 9;
     int32_t port = htonl(9092);
     memcpy(p, &port, 4); p += 4;
-    int32_t topicCount = htonl(0);
+    int32_t topicCount = htonl((int32_t)store.size());
     memcpy(p, &topicCount, 4); p += 4;
-    send(clientSocket, response, 35, 0);
+    for (auto& [name, partitions] : store) {
+        int16_t topicError = htons(0);
+        memcpy(p, &topicError, 2); p += 2;
+        int16_t nameLen = htons((int16_t)name.size());
+        memcpy(p, &nameLen, 2); p += 2;
+        memcpy(p, name.data(), name.size()); p += name.size();
+        int32_t partCount = htonl((int32_t)partitions.size());
+        memcpy(p, &partCount, 4); p += 4;
+        for (int i = 0; i < (int)partitions.size(); i++) {
+            int16_t partError = htons(0);
+            memcpy(p, &partError, 2); p += 2;
+            int32_t partIdx = htonl(i);
+            memcpy(p, &partIdx, 4); p += 4;
+            int32_t leaderId = htonl(0);
+            memcpy(p, &leaderId, 4); p += 4;
+            int32_t replicaCount = htonl(1);
+            memcpy(p, &replicaCount, 4); p += 4;
+            int32_t replicaNode = htonl(0);
+            memcpy(p, &replicaNode, 4); p += 4;
+            int32_t isrCount = htonl(1);
+            memcpy(p, &isrCount, 4); p += 4;
+            int32_t isrNode = htonl(0);
+            memcpy(p, &isrNode, 4); p += 4;
+        }
+    }
+    send(clientSocket, response.data(), response.size(), 0);
 }
 
 uint64_t readVarint(const std::vector<char>& buf, int& off) {
@@ -167,6 +234,11 @@ void handleMessage(int clientSocket, int epollfd, std::map<int, ConnectionState>
     std::cout << "clientId: " << clientId << "\n";
 
     if (apiKey == 0) {
+        std::cout << "parsing produce, msgBuffer size=" << msgBuffer.size() << "\n";
+        std::cout << "hex: ";
+        for (size_t i = 0; i < msgBuffer.size(); i++)
+            printf("%02x ", (uint8_t)msgBuffer[i]);
+        printf("\n");
         int16_t transIdLen;
         memcpy(&transIdLen, msgBuffer.data() + reqBodyOff, 2);
         reqBodyOff += 2;
@@ -185,14 +257,15 @@ void handleMessage(int clientSocket, int epollfd, std::map<int, ConnectionState>
         memcpy(&topicCount, msgBuffer.data() + reqBodyOff, 4);
         reqBodyOff += 4;
         topicCount = ntohl(topicCount);
+        std::cout << "topicCount: " << topicCount << "\n";
         for (int i = 0; i < topicCount; i++) {
             int16_t topicNameLen;
             memcpy(&topicNameLen, msgBuffer.data() + reqBodyOff, 2);
             reqBodyOff += 2;
-            char topicName[topicNameLen + 1]; // currently unused
-            memset(topicName, 0, topicNameLen + 1);
-            if (topicNameLen > 0) memcpy(topicName, msgBuffer.data() + reqBodyOff, topicNameLen);
+            topicNameLen = ntohs(topicNameLen);
+            std::string topicName(msgBuffer.data() + reqBodyOff, topicNameLen);
             reqBodyOff += topicNameLen;
+            std::cout << "topic: " << topicName << "\n";
             int32_t partitionCount;
             memcpy(&partitionCount, msgBuffer.data() + reqBodyOff, 4);
             reqBodyOff += 4;
@@ -221,65 +294,73 @@ void handleMessage(int clientSocket, int epollfd, std::map<int, ConnectionState>
                 int8_t magic;
                 memcpy(&magic, msgBuffer.data() + reqBodyOff, 1);
                 reqBodyOff += 1;
-                uint32_t crc;
-                memcpy(&crc, msgBuffer.data() + reqBodyOff, 4);
-                reqBodyOff += 4;
-                crc = ntohl(crc);
-                int16_t attributes;
-                memcpy(&attributes, msgBuffer.data() + reqBodyOff, 2);
-                reqBodyOff += 2;
-                attributes = ntohs(attributes);
-                int32_t lastOffsetDelta;
-                memcpy(&lastOffsetDelta, msgBuffer.data() + reqBodyOff, 4);
-                reqBodyOff += 4;
-                lastOffsetDelta = ntohl(lastOffsetDelta);
-                int64_t baseTimestamp;
-                memcpy(&baseTimestamp, msgBuffer.data() + reqBodyOff, 8);
-                reqBodyOff += 8;
-                baseTimestamp = be64toh(baseTimestamp);
-                int64_t maxTimestamp;
-                memcpy(&maxTimestamp, msgBuffer.data() + reqBodyOff, 8);
-                reqBodyOff += 8;
-                maxTimestamp = be64toh(maxTimestamp);
-                int64_t producerId;
-                memcpy(&producerId, msgBuffer.data() + reqBodyOff, 8);
-                reqBodyOff += 8;
-                producerId = be64toh(producerId);
-                int16_t producerEpoch;
-                memcpy(&producerEpoch, msgBuffer.data() + reqBodyOff, 2);
-                reqBodyOff += 2;
-                producerEpoch = ntohs(producerEpoch);
-                int32_t baseSequence;
-                memcpy(&baseSequence, msgBuffer.data() + reqBodyOff, 4);
-                reqBodyOff += 4;
-                baseSequence = ntohl(baseSequence);
-                int32_t recordCount;
-                memcpy(&recordCount, msgBuffer.data() + reqBodyOff, 4);
-                reqBodyOff += 4;
-                recordCount = ntohl(recordCount);
-                // records follow — each uses zigzag varint encoding
-                for (int k = 0; k < recordCount; k++) {
-                    uint64_t recordLength = readVarint(msgBuffer, reqBodyOff);
-                    reqBodyOff += 1; // attributes int8
-                    int64_t timestampDelta = decodeZigzag(readVarint(msgBuffer, reqBodyOff));
-                    uint64_t offsetDelta = readVarint(msgBuffer, reqBodyOff);
-                    int64_t keyLength = decodeZigzag(readVarint(msgBuffer, reqBodyOff));
-                    if (keyLength > 0) reqBodyOff += keyLength;
-                    int64_t valueLength = decodeZigzag(readVarint(msgBuffer, reqBodyOff));
-                    char value[valueLength];
-                    if (valueLength > 0) {
-                        memcpy(value, msgBuffer.data() + reqBodyOff, valueLength);
-                        reqBodyOff += valueLength;
-                        std::cout << "value: " << std::string(value, valueLength) << "\n";
+                if (magic < 2) {
+                    // Old MessageSet format: offset(8)+messageSize(4)+crc(4)+magic(1) already consumed
+                    reqBodyOff += 1; // attributes INT8
+                    if (magic == 1) reqBodyOff += 8; // timestamp INT64
+                    int32_t keyLen;
+                    memcpy(&keyLen, msgBuffer.data() + reqBodyOff, 4);
+                    reqBodyOff += 4;
+                    keyLen = ntohl(keyLen);
+                    if (keyLen > 0) reqBodyOff += keyLen;
+                    int32_t valueLen;
+                    memcpy(&valueLen, msgBuffer.data() + reqBodyOff, 4);
+                    reqBodyOff += 4;
+                    valueLen = ntohl(valueLen);
+                    if (valueLen > 0) {
+                        std::string val(msgBuffer.data() + reqBodyOff, valueLen);
+                        reqBodyOff += valueLen;
+                        std::cout << "value: " << val << "\n";
+                        if (store.find(topicName) == store.end())
+                            store[topicName] = std::vector<std::vector<std::string>>(index + 1);
+                        store[topicName][index].push_back(val);
                     }
-                    uint64_t headersCount = readVarint(msgBuffer, reqBodyOff);
-                    for (uint64_t l = 0; l < headersCount; l++) {
-                        int64_t headerKeyLen = decodeZigzag(readVarint(msgBuffer, reqBodyOff));
-                        if (headerKeyLen > 0) reqBodyOff += headerKeyLen;
-                        int64_t headerValLen = decodeZigzag(readVarint(msgBuffer, reqBodyOff));
-                        if (headerValLen > 0) reqBodyOff += headerValLen;
+                } else {
+                    // RecordBatch format (magic=2)
+                    uint32_t crc;
+                    memcpy(&crc, msgBuffer.data() + reqBodyOff, 4);
+                    reqBodyOff += 4;
+                    crc = ntohl(crc);
+                    int16_t attributes;
+                    memcpy(&attributes, msgBuffer.data() + reqBodyOff, 2);
+                    reqBodyOff += 2;
+                    attributes = ntohs(attributes);
+                    reqBodyOff += 4; // lastOffsetDelta
+                    reqBodyOff += 8; // baseTimestamp
+                    reqBodyOff += 8; // maxTimestamp
+                    reqBodyOff += 8; // producerId
+                    reqBodyOff += 2; // producerEpoch
+                    reqBodyOff += 4; // baseSequence
+                    int32_t recordCount;
+                    memcpy(&recordCount, msgBuffer.data() + reqBodyOff, 4);
+                    reqBodyOff += 4;
+                    recordCount = ntohl(recordCount);
+                    for (int k = 0; k < recordCount; k++) {
+                        readVarint(msgBuffer, reqBodyOff); // recordLength
+                        reqBodyOff += 1; // attributes INT8
+                        decodeZigzag(readVarint(msgBuffer, reqBodyOff)); // timestampDelta
+                        readVarint(msgBuffer, reqBodyOff); // offsetDelta
+                        int64_t keyLength = decodeZigzag(readVarint(msgBuffer, reqBodyOff));
+                        if (keyLength > 0) reqBodyOff += keyLength;
+                        int64_t valueLength = decodeZigzag(readVarint(msgBuffer, reqBodyOff));
+                        if (valueLength > 0) {
+                            std::string val(msgBuffer.data() + reqBodyOff, valueLength);
+                            reqBodyOff += valueLength;
+                            std::cout << "value: " << val << "\n";
+                            if (store.find(topicName) == store.end())
+                                store[topicName] = std::vector<std::vector<std::string>>(index + 1);
+                            store[topicName][index].push_back(val);
+                        }
+                        uint64_t headersCount = readVarint(msgBuffer, reqBodyOff);
+                        for (uint64_t l = 0; l < headersCount; l++) {
+                            int64_t headerKeyLen = decodeZigzag(readVarint(msgBuffer, reqBodyOff));
+                            if (headerKeyLen > 0) reqBodyOff += headerKeyLen;
+                            int64_t headerValLen = decodeZigzag(readVarint(msgBuffer, reqBodyOff));
+                            if (headerValLen > 0) reqBodyOff += headerValLen;
+                        }
                     }
                 }
+                sendProduceResponse(clientSocket, correlationId, topicName, index);
             }
         }
     } else if (apiKey == 18) {
@@ -318,8 +399,13 @@ void handleMessage(int clientSocket, int epollfd, std::map<int, ConnectionState>
                 reqBodyOff += 1; // tagged field
             }
         }
+        for (auto& name : names) {
+            if (!name.empty() && store.find(name) == store.end())
+                store[name] = std::vector<std::vector<std::string>>(1); // 1 partition
+        }
         sendMetadataResponse(clientSocket, correlationId);
     } else {
+        std::cout << "unhandled apiKey: " << apiKey << ", closing\n";
         closeConnection(clientSocket, epollfd, connections);
     }
 }
