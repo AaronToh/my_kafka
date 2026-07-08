@@ -54,10 +54,6 @@ void handleMessage(RingBuffer<QueueItem>& queue, int clientSocket, int epollfd, 
 
     if (apiKey == 0) {
         std::cout << "parsing produce, msgBuffer size=" << msgBuffer.size() << "\n";
-        std::cout << "hex: ";
-        for (size_t i = 0; i < msgBuffer.size(); i++)
-            printf("%02x ", (uint8_t)msgBuffer[i]);
-        printf("\n");
         int16_t transIdLen;
         memcpy(&transIdLen, msgBuffer.data() + reqBodyOff, 2);
         reqBodyOff += 2;
