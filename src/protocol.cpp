@@ -2,6 +2,7 @@
 
 #include <cstring>
 #include <endian.h>
+#include <iostream>
 #include <netinet/in.h>
 #include <unistd.h>
 #include <sys/socket.h>
@@ -188,4 +189,105 @@ int64_t decodeZigzag(uint64_t original) {
     } else {
         return -(int64_t)(original >> 1) - 1;
     }
+}
+
+void handleQueueItem(QueueItem& item) {
+    int clientSocket = item.clientSocket;
+    int32_t correlationId = item.correlationId;
+    std::string topicName = std::move(item.topicName);
+    int32_t partitionIndex = item.partitionIndex;
+    std::vector<char> recordsBuffer = std::move(item.recordsBuffer);
+    int recBodyOff = 0;
+    int64_t baseOffset;
+    memcpy(&baseOffset, recordsBuffer.data(), 8);
+    recBodyOff += 8;
+    baseOffset = be64toh(baseOffset);
+    int32_t batchLength;
+    memcpy(&batchLength, recordsBuffer.data() + recBodyOff, 4);
+    recBodyOff += 4;
+    batchLength = ntohl(batchLength);
+    int32_t partitionLeaderEpoch;
+    memcpy(&partitionLeaderEpoch, recordsBuffer.data() + recBodyOff, 4);
+    recBodyOff += 4;
+    partitionLeaderEpoch = ntohl(partitionLeaderEpoch);
+    int8_t magic;
+    memcpy(&magic, recordsBuffer.data() + recBodyOff, 1);
+    recBodyOff += 1;
+    if (magic < 2) {
+        while (true) {
+            // Old MessageSet format: offset(8)+messageSize(4)+crc(4)+magic(1) already consumed for this message
+            recBodyOff += 1; // attributes INT8
+            if (magic == 1) recBodyOff += 8; // timestamp INT64
+            int32_t keyLen;
+            memcpy(&keyLen, recordsBuffer.data() + recBodyOff, 4);
+            recBodyOff += 4;
+            keyLen = ntohl(keyLen);
+            if (keyLen > 0) recBodyOff += keyLen;
+            int32_t valueLen;
+            memcpy(&valueLen, recordsBuffer.data() + recBodyOff, 4);
+            recBodyOff += 4;
+            valueLen = ntohl(valueLen);
+            if (valueLen > 0) {
+                std::string val(recordsBuffer.data() + recBodyOff, valueLen);
+                recBodyOff += valueLen;
+                std::cout << "value: " << val << "\n";
+                if (store.find(topicName) == store.end())
+                    store[topicName] = std::vector<std::vector<std::string>>(partitionIndex + 1);
+                store[topicName][partitionIndex].push_back(val);
+            }
+
+            if (recBodyOff >= (int)recordsBuffer.size()) break;
+
+            // Next message: re-read its own offset(8)+messageSize(4)+crc(4)+magic(1) header
+            recBodyOff += 8 + 4 + 4;
+            memcpy(&magic, recordsBuffer.data() + recBodyOff, 1);
+            recBodyOff += 1;
+        }
+    } else {
+        // RecordBatch format (magic=2)
+        uint32_t crc;
+        memcpy(&crc, recordsBuffer.data() + recBodyOff, 4);
+        recBodyOff += 4;
+        crc = ntohl(crc);
+        int16_t attributes;
+        memcpy(&attributes, recordsBuffer.data() + recBodyOff, 2);
+        recBodyOff += 2;
+        attributes = ntohs(attributes);
+        recBodyOff += 4; // lastOffsetDelta
+        recBodyOff += 8; // baseTimestamp
+        recBodyOff += 8; // maxTimestamp
+        recBodyOff += 8; // producerId
+        recBodyOff += 2; // producerEpoch
+        recBodyOff += 4; // baseSequence
+        int32_t recordCount;
+        memcpy(&recordCount, recordsBuffer.data() + recBodyOff, 4);
+        recBodyOff += 4;
+        recordCount = ntohl(recordCount);
+        for (int k = 0; k < recordCount; k++) {
+            readVarint(recordsBuffer, recBodyOff); // recordLength
+            recBodyOff += 1; // attributes INT8
+            decodeZigzag(readVarint(recordsBuffer, recBodyOff)); // timestampDelta
+            readVarint(recordsBuffer, recBodyOff); // offsetDelta
+            int64_t keyLength = decodeZigzag(readVarint(recordsBuffer, recBodyOff));
+            if (keyLength > 0) recBodyOff += keyLength;
+            int64_t valueLength = decodeZigzag(readVarint(recordsBuffer, recBodyOff));
+            if (valueLength > 0) {
+                std::string val(recordsBuffer.data() + recBodyOff, valueLength);
+                recBodyOff += valueLength;
+                std::cout << "value: " << val << "\n";
+                if (store.find(topicName) == store.end())
+                    store[topicName] = std::vector<std::vector<std::string>>(partitionIndex + 1);
+                store[topicName][partitionIndex].push_back(val);
+            }
+            uint64_t headersCount = readVarint(recordsBuffer, recBodyOff);
+            for (uint64_t l = 0; l < headersCount; l++) {
+                int64_t headerKeyLen = decodeZigzag(readVarint(recordsBuffer, recBodyOff));
+                if (headerKeyLen > 0) recBodyOff += headerKeyLen;
+                int64_t headerValLen = decodeZigzag(readVarint(recordsBuffer, recBodyOff));
+                if (headerValLen > 0) recBodyOff += headerValLen;
+            }
+        }
+    }
+    // Todo: should be one response for a single request
+    sendProduceResponse(clientSocket, correlationId, topicName, partitionIndex);
 }

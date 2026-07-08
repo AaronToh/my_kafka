@@ -3,6 +3,7 @@
 #include <condition_variable>
 #include <cstddef>
 #include <mutex>
+#include <optional>
 #include <vector>
 
 template <typename T>
@@ -25,7 +26,8 @@ public:
         std::unique_lock<std::mutex> lock(mutex_);
         notEmpty_.wait(lock, [this] { return count_ > 0; });
 
-        T item = std::move(buffer_[head_]);
+        T item = std::move(*buffer_[head_]);
+        buffer_[head_].reset();
         head_ = (head_ + 1) % capacity_;
         count_--;
         lock.unlock();
@@ -36,7 +38,7 @@ public:
 
 private:
     size_t capacity_;
-    std::vector<T> buffer_;
+    std::vector<std::optional<T>> buffer_;
     size_t head_ = 0;
     size_t tail_ = 0;
     size_t count_ = 0;

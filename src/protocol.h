@@ -14,3 +14,21 @@ void sendMetadataResponse(int clientSocket, int32_t correlationId);
 
 uint64_t readVarint(const std::vector<char>& buf, int& off);
 int64_t decodeZigzag(uint64_t original);
+
+struct QueueItem {
+    int clientSocket;
+    int32_t correlationId;
+    std::string topicName;
+    int32_t partitionIndex;
+    std::vector<char> recordsBuffer;
+
+    QueueItem(int clientSocket, int32_t correlationId, std::string topicName, int32_t partitionIndex, std::vector<char> recordsBuffer)
+        : clientSocket(clientSocket),
+          correlationId(correlationId),
+          topicName(std::move(topicName)),
+          partitionIndex(partitionIndex),
+          recordsBuffer(std::move(recordsBuffer))
+    {}
+};
+
+void handleQueueItem(QueueItem& item);

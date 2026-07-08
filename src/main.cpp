@@ -5,12 +5,14 @@
 #include <map>
 #include <netinet/in.h>
 #include <string>
+#include <thread>
 #include <unistd.h>
 #include <vector>
 #include <sys/epoll.h>
 #include <sys/socket.h>
 
 #include "protocol.h"
+#include "ring_buffer.h"
 
 struct ConnectionState {
     size_t li = 0;
@@ -25,7 +27,7 @@ void closeConnection(int clientSocket, int epollfd, std::map<int, ConnectionStat
     connections.erase(clientSocket);
 }
 
-void handleMessage(int clientSocket, int epollfd, std::map<int, ConnectionState>& connections, std::vector<char>& msgBuffer) {
+void handleMessage(RingBuffer<QueueItem>& queue, int clientSocket, int epollfd, std::map<int, ConnectionState>& connections, std::vector<char>& msgBuffer) {
     std::cout << "handleMessage called\n";
     std::flush(std::cout);
     int16_t apiKey, apiVersion, clientIdLen;
@@ -88,96 +90,18 @@ void handleMessage(int clientSocket, int epollfd, std::map<int, ConnectionState>
             reqBodyOff += 4;
             partitionCount = ntohl(partitionCount);
             for (int j = 0; j < partitionCount; j++) {
-                int32_t index;
-                memcpy(&index, msgBuffer.data() + reqBodyOff, 4);
+                int32_t partitionIndex;
+                memcpy(&partitionIndex, msgBuffer.data() + reqBodyOff, 4);
                 reqBodyOff += 4;
-                index = ntohl(index);
+                partitionIndex = ntohl(partitionIndex);
                 int32_t recordsLength;
                 memcpy(&recordsLength, msgBuffer.data() + reqBodyOff, 4);
                 reqBodyOff += 4;
                 recordsLength = ntohl(recordsLength);
-                int64_t baseOffset;
-                memcpy(&baseOffset, msgBuffer.data() + reqBodyOff, 8);
-                reqBodyOff += 8;
-                baseOffset = be64toh(baseOffset);
-                int32_t batchLength;
-                memcpy(&batchLength, msgBuffer.data() + reqBodyOff, 4);
-                reqBodyOff += 4;
-                batchLength = ntohl(batchLength);
-                int32_t partitionLeaderEpoch;
-                memcpy(&partitionLeaderEpoch, msgBuffer.data() + reqBodyOff, 4);
-                reqBodyOff += 4;
-                partitionLeaderEpoch = ntohl(partitionLeaderEpoch);
-                int8_t magic;
-                memcpy(&magic, msgBuffer.data() + reqBodyOff, 1);
-                reqBodyOff += 1;
-                if (magic < 2) {
-                    // Old MessageSet format: offset(8)+messageSize(4)+crc(4)+magic(1) already consumed
-                    reqBodyOff += 1; // attributes INT8
-                    if (magic == 1) reqBodyOff += 8; // timestamp INT64
-                    int32_t keyLen;
-                    memcpy(&keyLen, msgBuffer.data() + reqBodyOff, 4);
-                    reqBodyOff += 4;
-                    keyLen = ntohl(keyLen);
-                    if (keyLen > 0) reqBodyOff += keyLen;
-                    int32_t valueLen;
-                    memcpy(&valueLen, msgBuffer.data() + reqBodyOff, 4);
-                    reqBodyOff += 4;
-                    valueLen = ntohl(valueLen);
-                    if (valueLen > 0) {
-                        std::string val(msgBuffer.data() + reqBodyOff, valueLen);
-                        reqBodyOff += valueLen;
-                        std::cout << "value: " << val << "\n";
-                        if (store.find(topicName) == store.end())
-                            store[topicName] = std::vector<std::vector<std::string>>(index + 1);
-                        store[topicName][index].push_back(val);
-                    }
-                } else {
-                    // RecordBatch format (magic=2)
-                    uint32_t crc;
-                    memcpy(&crc, msgBuffer.data() + reqBodyOff, 4);
-                    reqBodyOff += 4;
-                    crc = ntohl(crc);
-                    int16_t attributes;
-                    memcpy(&attributes, msgBuffer.data() + reqBodyOff, 2);
-                    reqBodyOff += 2;
-                    attributes = ntohs(attributes);
-                    reqBodyOff += 4; // lastOffsetDelta
-                    reqBodyOff += 8; // baseTimestamp
-                    reqBodyOff += 8; // maxTimestamp
-                    reqBodyOff += 8; // producerId
-                    reqBodyOff += 2; // producerEpoch
-                    reqBodyOff += 4; // baseSequence
-                    int32_t recordCount;
-                    memcpy(&recordCount, msgBuffer.data() + reqBodyOff, 4);
-                    reqBodyOff += 4;
-                    recordCount = ntohl(recordCount);
-                    for (int k = 0; k < recordCount; k++) {
-                        readVarint(msgBuffer, reqBodyOff); // recordLength
-                        reqBodyOff += 1; // attributes INT8
-                        decodeZigzag(readVarint(msgBuffer, reqBodyOff)); // timestampDelta
-                        readVarint(msgBuffer, reqBodyOff); // offsetDelta
-                        int64_t keyLength = decodeZigzag(readVarint(msgBuffer, reqBodyOff));
-                        if (keyLength > 0) reqBodyOff += keyLength;
-                        int64_t valueLength = decodeZigzag(readVarint(msgBuffer, reqBodyOff));
-                        if (valueLength > 0) {
-                            std::string val(msgBuffer.data() + reqBodyOff, valueLength);
-                            reqBodyOff += valueLength;
-                            std::cout << "value: " << val << "\n";
-                            if (store.find(topicName) == store.end())
-                                store[topicName] = std::vector<std::vector<std::string>>(index + 1);
-                            store[topicName][index].push_back(val);
-                        }
-                        uint64_t headersCount = readVarint(msgBuffer, reqBodyOff);
-                        for (uint64_t l = 0; l < headersCount; l++) {
-                            int64_t headerKeyLen = decodeZigzag(readVarint(msgBuffer, reqBodyOff));
-                            if (headerKeyLen > 0) reqBodyOff += headerKeyLen;
-                            int64_t headerValLen = decodeZigzag(readVarint(msgBuffer, reqBodyOff));
-                            if (headerValLen > 0) reqBodyOff += headerValLen;
-                        }
-                    }
-                }
-                sendProduceResponse(clientSocket, correlationId, topicName, index);
+                std::vector<char> recordsBuffer(msgBuffer.data() + reqBodyOff, msgBuffer.data() + reqBodyOff + recordsLength);
+                QueueItem item = QueueItem(clientSocket, correlationId, topicName, partitionIndex, recordsBuffer);
+                queue.push(item);
+                reqBodyOff += recordsLength;
             }
         }
     } else if (apiKey == 18) {
@@ -228,6 +152,14 @@ void handleMessage(int clientSocket, int epollfd, std::map<int, ConnectionState>
 }
 
 int main() {
+    RingBuffer<QueueItem> queue(20);
+    std::jthread worker([&queue] {
+        while (true) {
+            QueueItem item = queue.pop();
+            handleQueueItem(item);
+        }
+    });
+
     setbuf(stdout, NULL);
     int serverSocket = socket(AF_INET, SOCK_STREAM, 0);
     if (serverSocket == -1) {
@@ -321,7 +253,7 @@ int main() {
                     if (bytesRead < 0) { if (errno != EAGAIN) closeConnection(clientSocket, epollfd, connections); continue; }
                     state.mi += bytesRead;
                     if (state.mi == state.msgBuffer.size()) {
-                        handleMessage(clientSocket, epollfd, connections, state.msgBuffer);
+                        handleMessage(queue, clientSocket, epollfd, connections, state.msgBuffer);
                         state.li = 0;
                         state.mi = 0;
                         state.msgBuffer.clear();
