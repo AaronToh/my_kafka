@@ -3,11 +3,14 @@
 #include <cstring>
 #include <endian.h>
 #include <iostream>
+#include <memory>
 #include <netinet/in.h>
+#include <tuple>
 #include <unistd.h>
+#include <utility>
 #include <sys/socket.h>
 
-std::map<std::string, std::vector<std::vector<std::string>>> store;
+std::map<std::string, size_t> topicDirectory;
 
 void sendApiVerResponse(int clientSocket, int32_t correlationId, int16_t apiVersion) {
     if (apiVersion <= 2) {
@@ -84,32 +87,45 @@ void sendApiVerResponse(int clientSocket, int32_t correlationId, int16_t apiVers
     }
 }
 
-void sendProduceResponse(int clientSocket, int32_t correlationId, const std::string& topicName, int32_t partitionIndex) {
-    // body: corrId(4) + responses_count(4) + name_len(2) + name + partition_responses_count(4)
-    //       + index(4) + error_code(2) + base_offset(8) + log_append_time_ms(8) + throttle_time_ms(4)
-    int16_t nameLen = (int16_t)topicName.size();
-    int totalSize = 4 + 4 + 2 + nameLen + 4 + 4 + 2 + 8 + 8 + 4;
-    std::vector<char> response(4 + totalSize);
+void sendProduceResponse(int clientSocket, int32_t correlationId, std::vector<std::tuple<std::string, int32_t, size_t>>& results) {
+    // respLen(4) + corrId(4) + responses_count(4)
+    // [topics] name_len(2) + name + partition_responses_count(4)
+    // [partitions] index(4) + error_code(2) + base_offset(8) + log_append_time_ms(8)
+    // throttle_time_ms(4)
+    int totalSize = 4 + 4 + 4 + 4;
+    int topicSize = 6;
+    int partitionSize = 22;
+    std::map<std::string, std::vector<std::pair<int32_t, size_t>>> processedResults;
+    for (auto& [topicName, partitionIndex, baseOffset] : results) {
+        if (!processedResults.contains(topicName)) totalSize += topicSize + topicName.size();
+        processedResults[topicName].push_back({partitionIndex, baseOffset});
+        totalSize += partitionSize;
+    }
+    std::vector<char> response(totalSize);
     char* p = response.data();
-    int32_t respLen = htonl(totalSize);
+    int32_t respLen = htonl(totalSize - 4);
     memcpy(p, &respLen, 4); p += 4;
     int32_t corrId = htonl(correlationId);
     memcpy(p, &corrId, 4); p += 4;
-    int32_t topicCount = htonl(1);
+    int32_t topicCount = htonl(processedResults.size());
     memcpy(p, &topicCount, 4); p += 4;
-    int16_t nameLenN = htons(nameLen);
-    memcpy(p, &nameLenN, 2); p += 2;
-    memcpy(p, topicName.data(), nameLen); p += nameLen;
-    int32_t partCount = htonl(1);
-    memcpy(p, &partCount, 4); p += 4;
-    int32_t idx = htonl(partitionIndex);
-    memcpy(p, &idx, 4); p += 4;
-    int16_t errorCode = htons(0);
-    memcpy(p, &errorCode, 2); p += 2;
-    int64_t baseOffset = 0;
-    memcpy(p, &baseOffset, 8); p += 8;
-    int64_t logAppendTime = htobe64(-1);
-    memcpy(p, &logAppendTime, 8); p += 8;
+    for (auto& [topicName, partitionResults] : processedResults) {
+        int16_t topicNameLen = htons((int16_t)topicName.size());
+        memcpy(p, &topicNameLen, 2); p += 2;
+        memcpy(p, topicName.data(), topicName.size()); p += topicName.size();
+        int32_t partitionCount = htonl((int32_t)partitionResults.size());
+        memcpy(p, &partitionCount, 4); p += 4;
+        for (auto& [partitionIndex, baseOffset] : partitionResults) {
+            int32_t idx = htonl(partitionIndex);
+            memcpy(p, &idx, 4); p += 4;
+            int16_t errorCode = htons(0);
+            memcpy(p, &errorCode, 2); p += 2;
+            int64_t offset = htobe64((int64_t)baseOffset);
+            memcpy(p, &offset, 8); p += 8;
+            int64_t logAppendTime = htobe64(-1);
+            memcpy(p, &logAppendTime, 8); p += 8;
+        }
+    }
     int32_t throttle = htonl(0);
     memcpy(p, &throttle, 4); p += 4;
     send(clientSocket, response.data(), response.size(), 0);
@@ -120,8 +136,8 @@ void sendMetadataResponse(int clientSocket, int32_t correlationId) {
     // per topic: error(2) + name_len(2) + name + partitions_count(4)
     // per partition: error(2) + index(4) + leader(4) + replicas_count(4) + replica(4) + isr_count(4) + isr(4) = 26
     int bodySize = 4 + 19; // broker_count + broker(node_id+host+port)
-    for (auto& [name, partitions] : store)
-        bodySize += 2 + 2 + name.size() + 4 + (int)partitions.size() * 26;
+    for (auto& [name, partitionCount] : topicDirectory)
+        bodySize += 2 + 2 + name.size() + 4 + (int)partitionCount * 26;
     bodySize += 4; // topic_count
 
     std::vector<char> response(4 + 4 + bodySize);
@@ -139,17 +155,17 @@ void sendMetadataResponse(int clientSocket, int32_t correlationId) {
     memcpy(p, "localhost", 9); p += 9;
     int32_t port = htonl(9092);
     memcpy(p, &port, 4); p += 4;
-    int32_t topicCount = htonl((int32_t)store.size());
+    int32_t topicCount = htonl((int32_t)topicDirectory.size());
     memcpy(p, &topicCount, 4); p += 4;
-    for (auto& [name, partitions] : store) {
+    for (auto& [name, partitionCount] : topicDirectory) {
         int16_t topicError = htons(0);
         memcpy(p, &topicError, 2); p += 2;
         int16_t nameLen = htons((int16_t)name.size());
         memcpy(p, &nameLen, 2); p += 2;
         memcpy(p, name.data(), name.size()); p += name.size();
-        int32_t partCount = htonl((int32_t)partitions.size());
+        int32_t partCount = htonl((int32_t)partitionCount);
         memcpy(p, &partCount, 4); p += 4;
-        for (int i = 0; i < (int)partitions.size(); i++) {
+        for (int i = 0; i < (int)partitionCount; i++) {
             int16_t partError = htons(0);
             memcpy(p, &partError, 2); p += 2;
             int32_t partIdx = htonl(i);
@@ -191,12 +207,13 @@ int64_t decodeZigzag(uint64_t original) {
     }
 }
 
-void handleQueueItem(QueueItem& item) {
-    int clientSocket = item.clientSocket;
-    int32_t correlationId = item.correlationId;
+void handleQueueItem(QueueItem& item, std::map<std::pair<std::string, int32_t>, std::vector<std::string>>& store) {
+    std::shared_ptr<ProduceRequestState> sharedState = item.sharedState;
+    size_t writeIndex = item.writeIndex;
     std::string topicName = std::move(item.topicName);
     int32_t partitionIndex = item.partitionIndex;
     std::vector<char> recordsBuffer = std::move(item.recordsBuffer);
+    sharedState->results[writeIndex] = {topicName, partitionIndex, store[{topicName, partitionIndex}].size()};
     int recBodyOff = 0;
     int64_t baseOffset;
     memcpy(&baseOffset, recordsBuffer.data(), 8);
@@ -231,9 +248,7 @@ void handleQueueItem(QueueItem& item) {
                 std::string val(recordsBuffer.data() + recBodyOff, valueLen);
                 recBodyOff += valueLen;
                 std::cout << "value: " << val << "\n";
-                if (store.find(topicName) == store.end())
-                    store[topicName] = std::vector<std::vector<std::string>>(partitionIndex + 1);
-                store[topicName][partitionIndex].push_back(val);
+                store[{topicName, partitionIndex}].push_back(val);
             }
 
             if (recBodyOff >= (int)recordsBuffer.size()) break;
@@ -275,9 +290,7 @@ void handleQueueItem(QueueItem& item) {
                 std::string val(recordsBuffer.data() + recBodyOff, valueLength);
                 recBodyOff += valueLength;
                 std::cout << "value: " << val << "\n";
-                if (store.find(topicName) == store.end())
-                    store[topicName] = std::vector<std::vector<std::string>>(partitionIndex + 1);
-                store[topicName][partitionIndex].push_back(val);
+                store[{topicName, partitionIndex}].push_back(val);
             }
             uint64_t headersCount = readVarint(recordsBuffer, recBodyOff);
             for (uint64_t l = 0; l < headersCount; l++) {
@@ -288,6 +301,7 @@ void handleQueueItem(QueueItem& item) {
             }
         }
     }
-    // Todo: should be one response for a single request
-    sendProduceResponse(clientSocket, correlationId, topicName, partitionIndex);
+    if (--sharedState->remaining == 0) {
+        sendProduceResponse(sharedState->clientSocket, sharedState->correlationId, sharedState->results);
+    }
 }
