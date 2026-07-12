@@ -12,6 +12,10 @@ I first considered a thread pool to handle concurrent requests, but if a single 
 
 I decided to shard my data storage by topic and partition as order is only required within each partition and this decision mirrors what actual kafka does (i.e. distributes partitions across separate brokers/machines). I parallelised writing by spinning up multiple worker threads, with each worker thread owning its shard exclusively so no locking was needed on the data itself. Each worker thread has its own circular buffer that the epoll thread pushes requests onto, so the two never touched shared state directly. Requests are routed to a worker by hashing the topic and partition, so the same partition always lands on the same worker. Single requests may be spread across multiple worker threads, so a request state was maintained to track completion with an atomic counter. Each worker decrements the atomic counter as it finishes, and whichever one hits zero sends the final combined response - similar to Kafka's own "Purgatory" mechanism, which holds a request until multiple conditions are satisfied before responding.
 
+## Circular Buffer Implementation
+
+The circular buffer is used to synchronise the epoll thread and the worker threads that write to storage. I implemented two versions of the buffer. The first version uses a condition variable and a mutex, which eliminates busy waiting at the price of kernel context switches. The other version is a lock-free implementation that busy waits for the head or tail atomic variables to change, eliminating the need for kernel context switches at the price of spending CPU cycles while waiting. Reads and writes to these atomics use C++ acquire and release ordering - the writing thread releases only after it has written the actual data, and the reading thread acquires before reading that data, so it never observes a stale or partially written value.
+
 ## Build
 
 Since `epoll` is Linux-only, Docker is required on macOS:
