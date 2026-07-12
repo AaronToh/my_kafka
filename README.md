@@ -14,7 +14,7 @@ I decided to shard my data storage by topic and partition as order is only requi
 
 ## Circular Buffer Implementation
 
-The circular buffer is used to synchronise the epoll thread and the worker threads that write to storage. I implemented two versions of the buffer. The first version uses a condition variable and a mutex, which eliminates busy waiting at the price of kernel context switches. The other version is a lock-free implementation that busy waits for the head or tail atomic variables to change, eliminating the need for kernel context switches at the price of spending CPU cycles while waiting. Reads and writes to these atomics use C++ acquire and release ordering - the writing thread releases only after it has written the actual data, and the reading thread acquires before reading that data, so it never observes a stale or partially written value.
+The circular buffer is used to synchronise the epoll thread and the worker threads that write to storage. I implemented two versions of the buffer. The first version, [`cond_var_ring_buffer.h`](src/cond_var_ring_buffer.h), uses a condition variable and a mutex, which eliminates busy waiting at the price of kernel context switches. The other version, [`lock_free_ring_buffer.h`](src/lock_free_ring_buffer.h), busy waits for the head or tail atomic variables to change, eliminating the need for kernel context switches at the price of spending CPU cycles while waiting. Reads and writes to these atomics use `std::memory_order_release` and `std::memory_order_acquire`: the writing thread releases only after it has written the actual data, and the reading thread acquires before reading that data, so it never observes a stale or partially written value.
 
 ## Build
 
