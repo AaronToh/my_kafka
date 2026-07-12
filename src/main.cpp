@@ -14,7 +14,7 @@
 #include <sys/socket.h>
 
 #include "protocol.h"
-#include "ring_buffer.h"
+#include "lock_free_ring_buffer.h"
 
 struct ConnectionState {
     size_t li = 0;
@@ -29,7 +29,7 @@ void closeConnection(int clientSocket, int epollfd, std::map<int, ConnectionStat
     connections.erase(clientSocket);
 }
 
-void handleMessage(std::vector<std::unique_ptr<RingBuffer<QueueItem>>>& queues, int clientSocket, int epollfd, std::map<int, ConnectionState>& connections, std::vector<char>& msgBuffer) {
+void handleMessage(std::vector<std::unique_ptr<LockFreeRingBuffer<QueueItem>>>& queues, int clientSocket, int epollfd, std::map<int, ConnectionState>& connections, std::vector<char>& msgBuffer) {
     std::cout << "handleMessage called\n";
     std::flush(std::cout);
     int16_t apiKey, apiVersion, clientIdLen;
@@ -179,14 +179,14 @@ void handleMessage(std::vector<std::unique_ptr<RingBuffer<QueueItem>>>& queues, 
 
 int main() {
     const int NUM_WORKERS = 4;
-    std::vector<std::unique_ptr<RingBuffer<QueueItem>>> queues;
+    std::vector<std::unique_ptr<LockFreeRingBuffer<QueueItem>>> queues;
     queues.reserve(NUM_WORKERS);
-    for (int i = 0; i < NUM_WORKERS; i++) queues.push_back(std::make_unique<RingBuffer<QueueItem>>(20));
+    for (int i = 0; i < NUM_WORKERS; i++) queues.push_back(std::make_unique<LockFreeRingBuffer<QueueItem>>(20));
     std::vector<std::jthread> workers;
     for (int i = 0; i < NUM_WORKERS; i++) {
         workers.emplace_back([&queues, i] {
             std::map<std::pair<std::string, int32_t>, std::vector<std::string>> store;
-            RingBuffer<QueueItem>& queue = *queues[i];
+            LockFreeRingBuffer<QueueItem>& queue = *queues[i];
             while(true) {
                 QueueItem item = queue.pop();
                 handleQueueItem(item, store);

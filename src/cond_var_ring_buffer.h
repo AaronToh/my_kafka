@@ -7,9 +7,9 @@
 #include <vector>
 
 template <typename T>
-class RingBuffer {
+class CondVarRingBuffer {
 public:
-    explicit RingBuffer(size_t capacity) : capacity_(capacity), buffer_(capacity) {}
+    explicit CondVarRingBuffer(size_t capacity) : capacity_(capacity), buffer_(capacity) {}
 
     void push(T item) {
         std::unique_lock<std::mutex> lock(mutex_);

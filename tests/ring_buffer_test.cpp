@@ -4,10 +4,10 @@
 #include <thread>
 #include <vector>
 
-#include "ring_buffer.h"
+#include "cond_var_ring_buffer.h"
 
 void testSingleThreaded() {
-    RingBuffer<int> rb(3);
+    CondVarRingBuffer<int> rb(3);
 
     rb.push(1);
     rb.push(2);
@@ -27,7 +27,7 @@ void testThreaded() {
     const int capacity = 3;
     const int itemCount = 20;
 
-    RingBuffer<int> rb(capacity);
+    CondVarRingBuffer<int> rb(capacity);
     std::vector<int> consumed;
     consumed.reserve(itemCount);
 
